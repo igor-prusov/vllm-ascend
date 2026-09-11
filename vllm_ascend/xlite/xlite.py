@@ -944,9 +944,11 @@ class Qwen3_5XliteModel(StandardXliteModel):
         """Map hybrid caches to xlite: paged K/V for full layers, slot-major GDN states.
 
         GDN conv/ssm are addressed by vLLM mamba ``state_indices`` (stable per request),
-        not by the current batch row. Persistent buffers are slot-major; each forward
-        gathers into batch-major views that ``xlite._C`` consumes, then scatters back.
-        Slot 0 is reserved as ``NULL_BLOCK_ID``.
+        not by the current batch row. The persistent slot pools are handed to
+        ``xlite._C`` directly; each step's ``AttnMeta.state_indices`` tells the
+        linear-attention kernels which pool slot each batch row reads/writes, so no
+        batch-major staging gather/scatter is needed. Slot 0 is reserved as
+        ``NULL_BLOCK_ID`` (always zero).
         """
         cfg = self.xlite_config
         n_layers, interval = int(cfg.n_layers), int(cfg.full_attention_interval)
@@ -963,7 +965,6 @@ class Qwen3_5XliteModel(StandardXliteModel):
         self._xlite_hybrid_block_to_slot: dict[int, int] = {}
         self._xlite_hybrid_free_slots: list[int] = list(range(1, num_slots))
         self._xlite_hybrid_persistent: list[tuple[torch.Tensor, torch.Tensor]] = []
-        self._xlite_hybrid_batch: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._xlite_hybrid_state_refs: list[torch.Tensor] = []
         dtype = self.dtype
         ordered = list(kv_caches.values()) if isinstance(kv_caches, dict) else list(kv_caches)
@@ -1010,12 +1011,12 @@ class Qwen3_5XliteModel(StandardXliteModel):
             else:
                 conv_p = torch.zeros(num_slots, conv_dim, kernel, dtype=dtype, device=device)
                 ssm_p = torch.zeros(num_slots, n_v, k_dim, v_dim, dtype=dtype, device=device)
-                conv_b = torch.zeros(max_batch, conv_dim, kernel, dtype=dtype, device=device)
-                ssm_b = torch.zeros(max_batch, n_v, k_dim, v_dim, dtype=dtype, device=device)
                 self._xlite_hybrid_persistent.append((conv_p, ssm_p))
-                self._xlite_hybrid_batch.append((conv_b, ssm_b))
-                self._xlite_hybrid_state_refs.extend([conv_p, ssm_p, conv_b, ssm_b])
-                adapted.append([conv_b, ssm_b])
+                self._xlite_hybrid_state_refs.extend([conv_p, ssm_p])
+                # GDN layers expose the persistent slot pool directly; the kernels
+                # address slots via per-step ``state_indices`` (AttnMeta.state_indices),
+                # so no batch-major staging buffers or gather/scatter are needed.
+                adapted.append([conv_p, ssm_p])
         logger.info(
             "xlite hybrid KV adapted: layers=%s max_batch=%s gdn_slots=%s",
             n_layers,
@@ -1024,12 +1025,19 @@ class Qwen3_5XliteModel(StandardXliteModel):
         )
         return adapted
 
-    def _resolve_hybrid_dense_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
+    def _resolve_hybrid_dense_indices(
+        self,
+        state_indices: torch.Tensor,
+        cached_lens: list[int] | None = None,
+    ) -> torch.Tensor:
         """Map sparse mamba block IDs to dense local slots in ``[0, max_batch]``.
 
-        Slot 0 is reserved for ``NULL_BLOCK_ID``. Mappings are kept across steps so
-        chunked-prefill / token-budget skips do not drop GDN state. Slots are only
-        reclaimed when the free list is empty (steal a block not in this step).
+        Slot 0 is reserved for ``NULL_BLOCK_ID`` (always zero state). Mappings are
+        kept across steps so chunked-prefill / token-budget skips do not drop GDN
+        state. Slots are only reclaimed when the free list is empty (steal a block
+        not in this step). A recycled block mapping whose cached length is 0 gets
+        its slot zeroed here (fresh sequence), replacing the old gather-side
+        ``fresh_mask`` clearing.
         """
         from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -1052,14 +1060,21 @@ class Qwen3_5XliteModel(StandardXliteModel):
             return self._xlite_hybrid_free_slots.pop()
 
         dense: list[int] = []
-        for bid in ids:
+        for i, bid in enumerate(ids):
             if bid == NULL_BLOCK_ID:
-                dense.append(NULL_BLOCK_ID)
+                # Slot 0 is the reserved always-zero pool slot (state read-only).
+                dense.append(0)
                 continue
             slot = self._xlite_hybrid_block_to_slot.get(bid)
             if slot is None:
                 slot = _take_slot()
                 self._xlite_hybrid_block_to_slot[bid] = slot
+                for conv_p, ssm_p in self._xlite_hybrid_persistent:
+                    conv_p[slot].zero_()
+                    ssm_p[slot].zero_()
+            elif cached_lens is not None and i < len(cached_lens) and int(cached_lens[i]) == 0:
+                # Recycled mamba block IDs can reuse an existing dense mapping
+                # with stale state; cached_lens==0 marks a fresh sequence.
                 for conv_p, ssm_p in self._xlite_hybrid_persistent:
                     conv_p[slot].zero_()
                     ssm_p[slot].zero_()
@@ -1069,65 +1084,7 @@ class Qwen3_5XliteModel(StandardXliteModel):
             if getattr(self, "_xlite_hybrid_persistent", None)
             else state_indices.device
         )
-        return torch.tensor(dense, dtype=torch.long, device=device)
-
-    def _gather_hybrid_linear_states(
-        self,
-        state_indices: torch.Tensor,
-        cached_lens: list[int] | None = None,
-    ) -> None:
-        """Copy persistent slot states into the batch-major buffers seen by xlite."""
-        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
-        n = int(state_indices.numel())
-        if n <= 0 or not getattr(self, "_xlite_hybrid_persistent", None):
-            return
-        device = self._xlite_hybrid_persistent[0][0].device
-        idx = state_indices
-        if idx.device != device:
-            idx = idx.to(device, non_blocking=True)
-        null_mask = idx == NULL_BLOCK_ID
-        # Recycled mamba block IDs can reuse an existing dense mapping with stale
-        # state; treat cached_lens==0 as a fresh sequence and clear both sides.
-        fresh_mask = None
-        if cached_lens is not None and len(cached_lens) >= n:
-            fresh_mask = torch.tensor(
-                [int(cached_lens[i]) == 0 for i in range(n)],
-                dtype=torch.bool,
-                device=idx.device,
-            )
-            fresh_mask = fresh_mask & ~null_mask
-        for (conv_p, ssm_p), (conv_b, ssm_b) in zip(self._xlite_hybrid_persistent, self._xlite_hybrid_batch):
-            conv_b[:n].copy_(conv_p.index_select(0, idx))
-            ssm_b[:n].copy_(ssm_p.index_select(0, idx))
-            if bool(null_mask.any().item()):
-                conv_b[:n][null_mask] = 0
-                ssm_b[:n][null_mask] = 0
-            if fresh_mask is not None and bool(fresh_mask.any().item()):
-                conv_b[:n][fresh_mask] = 0
-                ssm_b[:n][fresh_mask] = 0
-                fresh_idx = idx[fresh_mask]
-                conv_p.index_fill_(0, fresh_idx, 0)
-                ssm_p.index_fill_(0, fresh_idx, 0)
-
-    def _scatter_hybrid_linear_states(self, state_indices: torch.Tensor) -> None:
-        """Write batch-major xlite states back to persistent dense slots."""
-        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
-        n = int(state_indices.numel())
-        if n <= 0 or not getattr(self, "_xlite_hybrid_persistent", None):
-            return
-        device = self._xlite_hybrid_persistent[0][0].device
-        idx = state_indices
-        if idx.device != device:
-            idx = idx.to(device, non_blocking=True)
-        valid = idx != NULL_BLOCK_ID
-        if not bool(valid.any().item()):
-            return
-        valid_idx = idx[valid]
-        for (conv_p, ssm_p), (conv_b, ssm_b) in zip(self._xlite_hybrid_persistent, self._xlite_hybrid_batch):
-            conv_p.index_copy_(0, valid_idx, conv_b[:n][valid])
-            ssm_p.index_copy_(0, valid_idx, ssm_b[:n][valid])
+        return torch.tensor(dense, dtype=torch.int32, device=device)
 
 
 class Qwen3_5MoeXliteModel(Qwen3_5XliteModel):
@@ -1514,15 +1471,17 @@ class XliteWrapper:
                         "xlite hybrid: GDN state_indices missing; using batch-row identity "
                         "(incorrect under continuous-batch reorder)"
                     )
+                state_indices = state_indices.to(torch.int32)
             else:
-                state_indices = self.adapter_xlite_model._resolve_hybrid_dense_indices(state_indices)
-            self.adapter_xlite_model._gather_hybrid_linear_states(state_indices, cached_lens_list)
+                state_indices = self.adapter_xlite_model._resolve_hybrid_dense_indices(state_indices, cached_lens_list)
             xlite_attn_metadata = AttnMeta()
             xlite_attn_metadata.lens = query_lens_list
             xlite_attn_metadata.cached_lens = cached_lens_list
             xlite_attn_metadata.block_tables_cpu = block_tables_list
             pos = positions[0] if positions.ndim == 2 else positions
             xlite_attn_metadata.positions = pos[:num_actual_tokens].contiguous()
+            # Kernels read/write the persistent slot pool directly via these indices.
+            xlite_attn_metadata.state_indices = state_indices
             num_tokens = (
                 getattr(forward_context, "max_tokens_across_dp", None) or forward_context.batch_descriptor.num_tokens
             )  # noqa: E501
@@ -1547,7 +1506,6 @@ class XliteWrapper:
                 )
                 if xlite_deepstack and hasattr(self.npu_runnable, "_clear_deepstack_input_embeds"):
                     self.npu_runnable._clear_deepstack_input_embeds(emb.size(0))
-            self.adapter_xlite_model._scatter_hybrid_linear_states(state_indices)
             return _ensure_output(h[:num_actual_tokens], "xlite hybrid forward")
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
