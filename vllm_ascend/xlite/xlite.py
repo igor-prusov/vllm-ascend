@@ -827,6 +827,25 @@ class XliteWrapper:
         """
         self.kv_caches = self.adapter_xlite_model.extract_kv_cache(kv_caches)
 
+    def _extract_gdn_state_indices(self, attn_metadata: Any) -> list[int] | None:
+        """Extract per-request GDN state block ids from the forward-context metadata.
+
+        vLLM pages the GDN conv/ssm state per request: each request's state slot is
+        addressed by its mamba block-table first column, exposed as
+        ``GDNAttentionMetadata.non_spec_state_indices_tensor`` ([batch] int32,
+        decodes-first then prefills, matching xlite's lens order). Full-attention
+        metadata has no such field. Returns None when no GDN metadata is present
+        (e.g. pure-MHA models), leaving ``state_indices_cpu`` empty.
+        """
+        metas = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
+        if not isinstance(metas, dict):
+            return None
+        for meta in metas.values():
+            indices = getattr(meta, "non_spec_state_indices_tensor", None)
+            if indices is not None:
+                return indices.tolist()
+        return None
+
     def __call__(
         self,
         input_ids: torch.Tensor,
@@ -899,6 +918,9 @@ class XliteWrapper:
         xlite_attn_metadata.lens = query_lens.tolist()
         xlite_attn_metadata.cached_lens = cached_lens.tolist()
         xlite_attn_metadata.block_tables_cpu = attn_metadata_router.block_tables.tolist()
+        gdn_state_indices = self._extract_gdn_state_indices(forward_context.attn_metadata)
+        if gdn_state_indices is not None:
+            xlite_attn_metadata.state_indices_cpu = gdn_state_indices
         if positions.ndim == 2:
             xlite_attn_metadata.positions = positions[:, :num_actual_tokens].contiguous()
             positions = positions[0]
