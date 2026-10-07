@@ -30,7 +30,7 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, AttnHybrid, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -96,6 +96,7 @@ class XliteModelBase(ABC):
         if isinstance(arcs, str):
             arcs = [arcs]
         for arc in arcs:
+            print(str(arc))
             if arc in _architecture_strategy_map:
                 raise ValueError(f"Duplicate xlite adapter for architecture {arc}: {_architecture_strategy_map[arc]}")
             _architecture_strategy_map[arc] = cls
@@ -113,6 +114,7 @@ class XliteModelBase(ABC):
             The constructor stores the runnable model and vLLM config, and prepares empty xlite configuration and model
             containers for subclass-specific population.
         """
+        print("XliteModelBase::init()")
         self.npu_runner = npu_runner
         self.npu_runnable = npu_runner.fallback_model
         self.vllm_config = vllm_config
@@ -124,6 +126,7 @@ class XliteModelBase(ABC):
         self._build_model()
         self.xlite_model.init(self.xlite_config, torch.distributed.get_rank())
         self.cossin_cache = self._precompute_freqs_cis()
+        print("XliteModelBase::init() [DONE]")
 
     def extract_kv_cache(self, kv_caches: list[tuple[torch.Tensor, ...]], /) -> list[tuple[torch.Tensor, ...]]:
         """Extract xlite-compatible KV cache from the vLLM-ascend KV cache.
@@ -136,6 +139,11 @@ class XliteModelBase(ABC):
         """
         # naively, the `kv_cache` is a list of <n_layers> tuples, each tuple contains two tensors of shape
         # [n_blocks, block_size, n_heads, head_dim] for K and V respectively.
+        print("XDBG: kv_cache len: ", len(kv_caches))
+        for x in kv_caches:
+            print(x[0].data_ptr(), x[1].data_ptr())
+
+        print("--------------------------")
         return kv_caches
 
     @abstractmethod
@@ -338,6 +346,7 @@ class StandardXliteModel(XliteModelBase):
         self.quantization = vllm_config.quant_config is not None
 
     def _build_model(self) -> None:
+        print("StandardXliteModel: _build_model()")
         xlite_model, xlite_config, hf_config = self.xlite_model, self.xlite_config, self.hf_text_config
         layers, model_prefix = self._get_layers_and_model_prefix()
 
@@ -348,9 +357,21 @@ class StandardXliteModel(XliteModelBase):
         else:
             xlite_model.head = get_dotted_attr(self.npu_runnable, f"{model_prefix}lm_head.weight", raises=True)
 
+        layer_types = self.hf_text_config.layer_types
+        is_full   = [lt == "full_attention"   for lt in layer_types]
+        is_linear = [lt == "linear_attention" for lt in layer_types]
+
         xlite_model.attn_norm = get_layer_weights(layers, "input_layernorm.weight")
-        self.init_matmul_weights(layers, "mha_qkv", "self_attn.qkv_proj")
-        self.init_matmul_weights(layers, "attn_out", "self_attn.o_proj")
+        self.init_matmul_weights(layers, "mha_qkv", "self_attn.qkv_proj", mask=is_full)
+        self.init_matmul_weights(layers, "attn_out", "self_attn.o_proj", mask=is_full)
+        self.init_matmul_weights(layers, "linear_out_proj", "linear_attn.out_proj", mask=is_linear)
+        self.init_matmul_weights(layers, "linear_in_proj_qkvz", "linear_attn.in_proj_qkvz", mask=is_linear)
+        self.init_matmul_weights(layers, "linear_in_proj_ba", "linear_attn.in_proj_ba", mask=is_linear)
+        self.init_matmul_weights(layers, "linear_conv1d", "linear_attn.conv1d", mask=is_linear)
+        xlite_model.linear_a_log = get_layer_weights(layers, "linear_attn.A_log", mask=is_linear)
+        # self.init_matmul_weights(layers, "linear_a_log", "linear_attn.A_log")
+        self.init_matmul_weights(layers, "linear_dt_bias", "linear_attn.dt_bias", mask=is_linear)
+        self.init_matmul_weights(layers, "linear_norm", "linear_attn.norm", mask=is_linear)
 
         with xlite_model.condition(lambda tensors: len(tensors) == xlite_config.n_layers):
             xlite_model.mha_q_norm = get_layer_weights(layers, "self_attn.q_norm.weight")
@@ -384,7 +405,7 @@ class StandardXliteModel(XliteModelBase):
         with xlite_model.condition(lambda tensors: not self.all_tensors_zero(tensors)):
             xlite_model.mha_qkv_bias = get_layer_weights(layers, "self_attn.qkv_proj.bias")
             xlite_config.qkv_bias = len(xlite_model.mha_qkv_bias) == xlite_config.n_layers
-            xlite_model.norm_bias = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.bias", raises=True)
+            xlite_model.norm_bias = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.bias")
             xlite_model.attn_norm_bias = get_layer_weights(layers, "input_layernorm.bias")
             xlite_model.mlp_norm_bias = get_layer_weights(layers, "post_attention_layernorm.bias")
             if xlite_config.qk_norm:
@@ -449,7 +470,11 @@ class StandardXliteModel(XliteModelBase):
                 :meth:`get_layer_weights` for details.
         """
         xlite_model = self.xlite_model
-        setattr(xlite_model, xlite_prefix, get_layer_weights(layers, f"{model_prefix}.weight", mask=mask))
+        logger.info(f"Setting up weights: {model_prefix} -> {xlite_prefix}")
+        w = get_layer_weights(layers, f"{model_prefix}.weight", mask=mask)
+        if xlite_prefix == "linear_in_proj_qkv":
+            print(w)
+        setattr(xlite_model, xlite_prefix, w)
         if not self.quantization:
             return
 
@@ -691,6 +716,25 @@ class MiniMaxM2XliteModel(StandardXliteModel):
         xlite_config.scoring_func = ScoringFuncSigmoid
         xlite_config.gate_captured = False
 
+class Qwen3_5XliteModel(StandardXliteModel):
+    """xlite adapter for dense Qwen3.5 hybrid (MHA + GDN)."""
+    _supported_architectures = ["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"]
+
+    def _build_model_config(self) -> None:
+        print("MY!!!: _build_model_config")
+        super()._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+        xlite_config.attn_type = AttnHybrid
+        xlite_config.attn_output_gate = True
+        xlite_config.linear_num_k_heads = hf_config.linear_num_key_heads
+        xlite_config.linear_num_v_heads = hf_config.linear_num_value_heads
+        xlite_config.linear_key_head_dim = hf_config.linear_key_head_dim
+        xlite_config.linear_value_head_dim = hf_config.linear_value_head_dim
+        xlite_config.linear_conv_kernel_dim = hf_config.linear_conv_kernel_dim
+
+    def _build_model(self) -> None:
+        print("MY!!!: _build_model")
+        super()._build_model()
 
 def get_adapter_xlite_model(npu_runner: "XliteModelRunner", vllm_config: VllmConfig) -> XliteModelBase:
     """Look up and initialize the appropriate xlite model adapter based on the architecture specified in vLLM config and
@@ -726,6 +770,7 @@ class XliteWrapper:
         Raises:
             ValueError: If xlite runtime tensor-pool initialization fails.
         """
+        print("!!!! XLite wrapper init [START]")
         self.npu_runner = npu_runner
         self.npu_runnable = npu_runner.fallback_model
         self.device = device
@@ -749,6 +794,7 @@ class XliteWrapper:
         self.hidden_states = torch.empty(
             xlite_config.max_m, xlite_config.hidden_size, device=self.device, dtype=self.adapter_xlite_model.dtype
         )
+        print("!!!! XLite wrapper init [MID]")
 
         rt_pool_size = self.xlite_model.get_tensor_pool_size()
         if torch.distributed.get_rank() == 0:
