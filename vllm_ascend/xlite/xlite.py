@@ -370,7 +370,7 @@ class StandardXliteModel(XliteModelBase):
         self.init_matmul_weights(layers, "linear_conv1d", "linear_attn.conv1d", mask=is_linear)
         xlite_model.linear_a_log = get_layer_weights(layers, "linear_attn.A_log", mask=is_linear)
         # self.init_matmul_weights(layers, "linear_a_log", "linear_attn.A_log")
-        self.init_matmul_weights(layers, "linear_dt_bias", "linear_attn.dt_bias", mask=is_linear)
+        xlite_model.linear_dt_bias = get_layer_weights(layers, "linear_attn.dt_bias", mask=is_linear)
         self.init_matmul_weights(layers, "linear_norm", "linear_attn.norm", mask=is_linear)
 
         with xlite_model.condition(lambda tensors: len(tensors) == xlite_config.n_layers):
