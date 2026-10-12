@@ -33,7 +33,7 @@ from vllm.sequence import IntermediateTensors
 from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, AttnHybrid, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.xlite.utils import (
     AttnMetadataRouter,
     WeightGetterConfig,
@@ -51,6 +51,22 @@ XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch
 
 _architecture_strategy_map: dict[str, type["XliteModelBase"]] = {}
 """Mapping from model architecture names in `config.json` to their corresponding xlite adapter classes."""
+
+_XPROBE_COUNTS: dict[str, int] = {}
+
+
+def _xprobe(key: str, msg: str, limit: int = 1) -> None:
+    """Emit a one-shot diagnostic probe (grep output for ``[XPROBE]``).
+
+    ``msg`` is printed up to ``limit`` times per process for a given ``key`` so
+    decode loops stay quiet. Use ``limit > 1`` for per-forward diagnostics such
+    as state-index/len ordering checks.
+    """
+    n = _XPROBE_COUNTS.get(key, 0)
+    if n >= limit:
+        return
+    _XPROBE_COUNTS[key] = n + 1
+    print(f"[XPROBE] {key}[{n}]: {msg}", flush=True)
 
 
 class XliteModelBase(ABC):
@@ -351,7 +367,9 @@ class StandardXliteModel(XliteModelBase):
         layers, model_prefix = self._get_layers_and_model_prefix()
 
         xlite_model.embed = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.embed_tokens.weight", raises=True)
-        xlite_model.norm = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.weight", raises=True)
+        # Qwen3.5 uses Gemma-style RMSNorm (x * (1 + w)); xlite's norm kernel applies
+        # standard RMSNorm (x * w), so pre-offset the weights by +1.
+        xlite_model.norm = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.weight", raises=True) + 1.0
         if hf_config.tie_word_embeddings:
             xlite_model.head = xlite_model.embed
         else:
@@ -361,27 +379,38 @@ class StandardXliteModel(XliteModelBase):
         is_full   = [lt == "full_attention"   for lt in layer_types]
         is_linear = [lt == "linear_attention" for lt in layer_types]
 
-        xlite_model.attn_norm = get_layer_weights(layers, "input_layernorm.weight")
+        xlite_model.attn_norm = [w + 1.0 for w in get_layer_weights(layers, "input_layernorm.weight")]
         self.init_matmul_weights(layers, "mha_qkv", "self_attn.qkv_proj", mask=is_full)
         self.init_matmul_weights(layers, "attn_out", "self_attn.o_proj", mask=is_full)
         self.init_matmul_weights(layers, "linear_out_proj", "linear_attn.out_proj", mask=is_linear)
         self.init_matmul_weights(layers, "linear_in_proj_qkvz", "linear_attn.in_proj_qkvz", mask=is_linear)
         self.init_matmul_weights(layers, "linear_in_proj_ba", "linear_attn.in_proj_ba", mask=is_linear)
         self.init_matmul_weights(layers, "linear_conv1d", "linear_attn.conv1d", mask=is_linear)
-        xlite_model.linear_a_log = get_layer_weights(layers, "linear_attn.A_log", mask=is_linear)
-        # self.init_matmul_weights(layers, "linear_a_log", "linear_attn.A_log")
-        xlite_model.linear_dt_bias = get_layer_weights(layers, "linear_attn.dt_bias", mask=is_linear)
+        # A_log and dt_bias are fp32 parameters, but XliteOpBetaDecay dispatches on
+        # the b/a dtype (bf16) and reads A_log/dt_bias as bf16. Cast them so the
+        # gating kernel reads the correct top-16 bits instead of the fp32 low bits.
+        xlite_model.linear_a_log = [
+            w.to(self.dtype) if w.numel() else w
+            for w in get_layer_weights(layers, "linear_attn.A_log", mask=is_linear)
+        ]
+        xlite_model.linear_dt_bias = [
+            w.to(self.dtype) if w.numel() else w
+            for w in get_layer_weights(layers, "linear_attn.dt_bias", mask=is_linear)
+        ]
         self.init_matmul_weights(layers, "linear_norm", "linear_attn.norm", mask=is_linear)
 
-        with xlite_model.condition(lambda tensors: len(tensors) == xlite_config.n_layers):
-            xlite_model.mha_q_norm = get_layer_weights(layers, "self_attn.q_norm.weight")
-            xlite_model.mha_k_norm = get_layer_weights(layers, "self_attn.k_norm.weight")
-            xlite_config.qk_norm = bool(xlite_model.mha_q_norm) and bool(xlite_model.mha_k_norm)
+        # QK-RMSNorm (Gemma-style, +1) exists only on full-attention layers; use the
+        # per-layer mask so the hybrid layer pattern keeps correct indexing.
+        mha_q_norm = [w + 1.0 if w.numel() else w for w in get_layer_weights(layers, "self_attn.q_norm.weight", mask=is_full)]
+        mha_k_norm = [w + 1.0 if w.numel() else w for w in get_layer_weights(layers, "self_attn.k_norm.weight", mask=is_full)]
+        xlite_config.qk_norm = any(w.numel() for w in mha_q_norm) and any(w.numel() for w in mha_k_norm)
+        xlite_model.mha_q_norm = mha_q_norm
+        xlite_model.mha_k_norm = mha_k_norm
 
         # Dense MLP weights
         self.init_matmul_weights(layers, "mlp_up_gate", "mlp.gate_up_proj")
         self.init_matmul_weights(layers, "mlp_down", "mlp.down_proj")
-        xlite_model.mlp_norm = get_layer_weights(layers, "post_attention_layernorm.weight")
+        xlite_model.mlp_norm = [w + 1.0 for w in get_layer_weights(layers, "post_attention_layernorm.weight")]
 
         # MoE-specific weights
         mlp_prefix = self._decoder_layer_mlp_module
@@ -731,6 +760,13 @@ class Qwen3_5XliteModel(StandardXliteModel):
         xlite_config.linear_key_head_dim = hf_config.linear_key_head_dim
         xlite_config.linear_value_head_dim = hf_config.linear_value_head_dim
         xlite_config.linear_conv_kernel_dim = hf_config.linear_conv_kernel_dim
+        # Hybrid attn/mamba: the full-attention KV cache and its block table are
+        # re-sliced to the attention backend's kernel block size (128), not
+        # cache_config.block_size (which patch_mamba_config bumps to 1024 to align
+        # the mamba/attention page sizes). Plumb the kernel block size so xlite's
+        # block-table/slot-mapping math stays consistent with the 128-block cache.
+        xlite_config.block_size = AscendAttentionBackend.get_supported_kernel_block_sizes()[0]
+        _xprobe("cfg.block_size", f"block_size={xlite_config.block_size} (cache_config={self.vllm_config.cache_config.block_size})")
 
     def _build_model(self) -> None:
         print("MY!!!: _build_model")
@@ -839,11 +875,22 @@ class XliteWrapper:
         """
         metas = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
         if not isinstance(metas, dict):
+            _xprobe("gdn_indices.no_metadata", f"attn_metadata not a dict: {type(metas).__name__}")
             return None
         for meta in metas.values():
             indices = getattr(meta, "non_spec_state_indices_tensor", None)
             if indices is not None:
+                _xprobe(
+                    "gdn_indices.found",
+                    f"indices dtype={indices.dtype} shape={tuple(indices.shape)} "
+                    f"values(first 8)={indices.flatten()[:8].tolist()}",
+                )
                 return indices.tolist()
+        _xprobe(
+            "gdn_indices.missing",
+            "no metadata with non_spec_state_indices_tensor among "
+            + ", ".join(type(v).__name__ for v in metas.values()),
+        )
         return None
 
     def __call__(
@@ -882,8 +929,20 @@ class XliteWrapper:
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
         attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
+        _xprobe(
+            "routing.metadata_dict",
+            "keys/types(first 8): "
+            + ", ".join(f"{k}={type(v).__name__}" for k, v in list(attn_metadata.items())[:8]),
+        )
         attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
+        _xprobe(
+            "routing.resolve",
+            f"resolved type={type(attn_metadata).__name__} "
+            f"expected={getattr(self.adapter_xlite_model, '_attn_metadata_type', None)}",
+        )
         if not isinstance(attn_metadata, self.adapter_xlite_model._attn_metadata_type):
+            _xprobe("routing.fallback", "FALLING BACK to npu_runnable (metadata type mismatch)")
+            print("XDBG: Fall back to runnable...")
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
         with_prefill = attn_metadata.attn_state not in (
@@ -903,6 +962,7 @@ class XliteWrapper:
         if not use_xlite_graph:
             # fall back to runnable for prefill in decode-only mode
             # or when the number of tokens exceeds the graph capacity in non-full mode
+            _xprobe("routing.no_graph", "FALLING BACK to npu_runnable (not use_xlite_graph)")
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
@@ -921,11 +981,28 @@ class XliteWrapper:
         gdn_state_indices = self._extract_gdn_state_indices(forward_context.attn_metadata)
         if gdn_state_indices is not None:
             xlite_attn_metadata.state_indices_cpu = gdn_state_indices
+        _xprobe(
+            "ordering.lens_vs_state",
+            "batch=%d lens=%s cached=%s state_indices=%s"
+            % (
+                len(query_lens.tolist()),
+                query_lens.tolist(),
+                cached_lens.tolist(),
+                gdn_state_indices if gdn_state_indices is not None else None,
+            ),
+            limit=6,
+        )
         if positions.ndim == 2:
             xlite_attn_metadata.positions = positions[:, :num_actual_tokens].contiguous()
             positions = positions[0]
         else:
             xlite_attn_metadata.positions = positions
+
+        _xprobe(
+            "routing.xlite_forward",
+            "calling xlite_model.forward (num_actual_tokens=%s, batch=%d, with_prefill=%s)"
+            % (num_actual_tokens, len(xlite_attn_metadata.lens), with_prefill),
+        )
 
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
         h = self.hidden_states[:num_tokens]
@@ -951,4 +1028,14 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.npu_runnable, "_clear_deepstack_input_embeds"):
                 self.npu_runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
+        _xprobe(
+            "out.hidden",
+            "h[0,:8]=%s absmax=%.4g nan=%s"
+            % (
+                [float(x) for x in h[0, :8].float().cpu().tolist()],
+                float(h.float().abs().max().item()),
+                bool(h.isnan().any().item()),
+            ),
+            limit=3,
+        )
         return h[:num_actual_tokens]
