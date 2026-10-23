@@ -31,6 +31,7 @@ from xlite._C import Model, ModelConfig
 from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 _MISSING = object()
 """Unique sentinel for missing attributes in this module."""
@@ -338,14 +339,17 @@ class AttnMetadataRouter:
     def block_tables(self) -> torch.Tensor:
         """Get the block tables from the attention metadata, if available."""
         if isinstance(self.attn_metadata, AscendMetadata):
+            logger.info("block_tables: got AscendMetadata")
             return torch.as_tensor(self.attn_metadata.block_tables, device=self.device)
 
         if isinstance(self.attn_metadata, AscendSFAMetadata):
+            logger.info("block_tables: got AscendSFAMetadata")
             return torch.as_tensor(self.attn_metadata.block_table, device=self.device)
 
         if isinstance(self.attn_metadata, AscendMLAMetadata):
             # AscendMLAMetadataBuilder.build_decode_metadata breaks `AscendMLAMetadata.block_tables`
             # thus we may need to patch together block tables from prefill and decode metadata if available
+            logger.info("block_tables: got AscendMLAMetadata")
             block_tables = []
             if self.attn_metadata.decode is not None:
                 block_tables.append(torch.as_tensor(self.attn_metadata.decode.block_table, device=self.device))
@@ -354,9 +358,15 @@ class AttnMetadataRouter:
             if block_tables:
                 return torch.concat(block_tables, dim=0)
             return torch.as_tensor(self.attn_metadata.block_tables, device=self.device)
+        
+        if isinstance(self.attn_metadata, GDNAttentionMetadata):
+            logger.info("block_tables: got GDNAttentionMetadata")
+            return torch.as_tensor(self.attn_metadata.non_spec_state_indices_tensor, device=self.device)
 
+        logger.info("block_tables: not a known instance...")
         for candidate in ["block_tables", "block_table"]:
             if (tables := getattr(self.attn_metadata, candidate)) is not None:
+                logger.info(f"block_tables: Got candidate {candidate}")
                 return torch.as_tensor(tables, device=self.device)
 
         raise ValueError(f"Cannot find block tables in attention metadata of type {type(self.attn_metadata)}.")
